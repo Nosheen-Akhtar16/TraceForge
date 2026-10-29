@@ -1,0 +1,59 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ReplayOS Recorder</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      width: 300px;
+      padding: 14px;
+    }
+
+    h2 {
+      margin-top: 0;
+    }
+
+    label {
+      display: block;
+      margin-top: 12px;
+      font-size: 13px;
+    }
+
+    input, button {
+      box-sizing: border-box;
+      width: 100%;
+      padding: 9px;
+      margin-top: 5px;
+    }
+
+    button {
+      cursor: pointer;
+    }
+
+    #status {
+      font-size: 12px;
+      overflow-wrap: anywhere;
+      margin-top: 12px;
+    }
+  </style>
+</head>
+<body>
+  <h2>ReplayOS Recorder</h2>
+
+  <label for="projectId">Project ID</label>
+  <input id="projectId" placeholder="proj_..." />
+
+  <label for="sessionId">Session ID</label>
+  <input id="sessionId" placeholder="sess_..." />
+
+  <button id="start">Start recording on this tab</button>
+  <button id="stop">Stop recording</button>
+
+  <p id="status">Recording stopped.</p>
+
+  <script src="popup.js"></script>
+</body>
+</html>
