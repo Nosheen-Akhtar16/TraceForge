@@ -1,4 +1,3 @@
-
 from contextlib import asynccontextmanager
 from uuid import uuid4
 from datetime import datetime
@@ -7,6 +6,7 @@ import json
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 
@@ -113,13 +113,82 @@ def init_db():
                 ADD COLUMN plan_id TEXT
             """)
 
+            columns = conn.execute(
+            "PRAGMA table_info(reproduction_attempts)"
+        ).fetchall()
+
+        column_names = {column[1] for column in columns}
+
+                # Safely migrate existing databases.
+        columns = conn.execute(
+            "PRAGMA table_info(reproduction_attempts)"
+        ).fetchall()
+
+        column_names = {column[1] for column in columns}
+
+        if "plan_id" not in column_names:
+            conn.execute("""
+                ALTER TABLE reproduction_attempts
+                ADD COLUMN plan_id TEXT
+            """)
+
+        if "conditions_json" not in column_names:
+            conn.execute("""
+                ALTER TABLE reproduction_attempts
+                ADD COLUMN conditions_json TEXT NOT NULL DEFAULT '{}'
+            """)
+
+        # Create experiment recommendation lifecycle table.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS experiment_recommendations (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                failure_event_id TEXT NOT NULL,
+                based_on_attempts TEXT NOT NULL DEFAULT '[]',
+                recommendation_data TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'proposed'
+                    CHECK (
+                        status IN (
+                            'proposed',
+                            'accepted',
+                            'skipped',
+                            'completed'
+                        )
+                    ),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (session_id) REFERENCES sessions(id),
+                FOREIGN KEY (failure_event_id) REFERENCES events(id)
+            )
+        """)
+
+        # Add recommendation link to existing attempts.
+        columns = conn.execute(
+            "PRAGMA table_info(reproduction_attempts)"
+        ).fetchall()
+
+        column_names = {column[1] for column in columns}
+
+        if "recommendation_id" not in column_names:
+            conn.execute("""
+                ALTER TABLE reproduction_attempts
+                ADD COLUMN recommendation_id TEXT
+            """)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
     yield
 
 
-app = FastAPI(title="ReplayOS API", lifespan=lifespan)
+app = FastAPI(title="TraceForge API", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+    allow_headers=["Content-Type"],
+)
 
 
 class ProjectCreate(BaseModel):
@@ -138,12 +207,14 @@ class EventCreate(BaseModel):
 class ReproductionAttemptCreate(BaseModel):
     failure_event_id: str = Field(min_length=1)
     plan_id: str | None = None
+    recommendation_id: str | None = None
     outcome: Literal[
         "reproduced",
         "not_reproduced",
         "inconclusive",
     ]
     notes: str = Field(default="", max_length=1000)
+    conditions: dict[str, Any] = Field(default_factory=dict)
 class ReproductionPlanStatusUpdate(BaseModel):
     status: Literal[
         "draft",
@@ -151,7 +222,13 @@ class ReproductionPlanStatusUpdate(BaseModel):
         "failed",
         "inconclusive",
     ]
-
+class ExperimentRecommendationStatusUpdate(BaseModel):
+    status: Literal[
+        "proposed",
+        "accepted",
+        "skipped",
+        "completed",
+    ]
 @app.post("/projects", status_code=201)
 def create_project(project: ProjectCreate):
     name = project.name.strip()
@@ -1007,6 +1084,8 @@ def create_reproduction_attempt(
                 "The selected event is not a recognized failure event",
             )
 
+        
+        
         # Validate the reproduction plan when plan_id is provided.
         if attempt.plan_id is not None:
             plan = conn.execute("""
@@ -1029,7 +1108,36 @@ def create_reproduction_attempt(
                     422,
                     "The reproduction plan belongs to a different failure",
                 )
+        # Validate the linked experiment recommendation.
+        if attempt.recommendation_id is not None:
+            recommendation = conn.execute("""
+                SELECT id, failure_event_id, status
+                FROM experiment_recommendations
+                WHERE id = ? AND session_id = ?
+            """, (
+                attempt.recommendation_id,
+                session_id,
+            )).fetchone()
 
+            if recommendation is None:
+                raise HTTPException(
+                    404,
+                    "Experiment recommendation not found in this session",
+                )
+
+            if recommendation[1] != attempt.failure_event_id:
+                raise HTTPException(
+                    422,
+                    "The recommendation belongs to a different failure",
+                )
+
+            if recommendation[2] != "accepted":
+                raise HTTPException(
+                    422,
+                    "Only an accepted recommendation can be linked to an attempt",
+                )
+        # Save the attempt whether or not a plan_id was provided.
+        
         conn.execute("""
             INSERT INTO reproduction_attempts (
                 id,
@@ -1037,9 +1145,11 @@ def create_reproduction_attempt(
                 failure_event_id,
                 outcome,
                 notes,
-                plan_id
+                plan_id,
+                conditions_json,
+                recommendation_id
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             attempt_id,
             session_id,
@@ -1047,7 +1157,10 @@ def create_reproduction_attempt(
             attempt.outcome,
             notes,
             attempt.plan_id,
+            json.dumps(attempt.conditions),
+            attempt.recommendation_id,
         ))
+
 
     return {
         "attempt_id": attempt_id,
@@ -1056,6 +1169,8 @@ def create_reproduction_attempt(
         "plan_id": attempt.plan_id,
         "outcome": attempt.outcome,
         "notes": notes,
+        "conditions": attempt.conditions,
+        "recommendation_id": attempt.recommendation_id,
     }
 
 
@@ -1080,15 +1195,25 @@ def list_reproduction_attempts(session_id: str):
                 plan_id,
                 outcome,
                 notes,
+                recommendation_id,
+                conditions_json,
                 created_at
             FROM reproduction_attempts
             WHERE session_id = ?
             ORDER BY created_at ASC, rowid ASC
         """, (session_id,)).fetchall()
 
-    return {
-        "attempts": [dict(row) for row in rows]
-    }
+    attempts = []
+    for row in rows:
+        item = dict(row)
+        item["conditions"] = json.loads(
+            item.pop("conditions_json") or "{}"
+        )
+        attempts.append(item)
+
+    return {"attempts": attempts}
+
+    
 def calculate_confidence_score(
     failure_type,
     preceding_events,
@@ -1478,8 +1603,735 @@ def calculate_confidence_score(
             "Repeated failures may share the same underlying cause or conditions.",
         ],
     }
+@app.get("/sessions/{session_id}/reproduction-attempts/compare")
+def compare_reproduction_attempts(
+    session_id: str,
+    attempt_a_id: str,
+    attempt_b_id: str,
+):
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                id,
+                session_id,
+                failure_event_id,
+                outcome,
+                conditions_json
+            FROM reproduction_attempts
+            WHERE session_id = ?
+              AND id IN (?, ?)
+            """,
+            (session_id, attempt_a_id, attempt_b_id),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    attempts_by_id = {
+        row["id"]: dict(row)
+        for row in rows
+    }
+
+    if (
+        attempt_a_id not in attempts_by_id
+        or attempt_b_id not in attempts_by_id
+    ):
+        raise HTTPException(
+            status_code=404,
+            detail="One or both attempts were not found in this session.",
+        )
+
+    attempt_a = attempts_by_id[attempt_a_id]
+    attempt_b = attempts_by_id[attempt_b_id]
+
+    if attempt_a_id == attempt_b_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Select two different reproduction attempts.",
+        )
+
+    if attempt_a["failure_event_id"] != attempt_b["failure_event_id"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Attempts must belong to the same failure event.",
+        )
+
+    conditions_a = json.loads(
+        attempt_a.get("conditions_json") or "{}"
+    )
+    conditions_b = json.loads(
+        attempt_b.get("conditions_json") or "{}"
+    )
+
+    comparison = compare_conditions(
+        conditions_a,
+        conditions_b,
+    )
+
+    return {
+        "session_id": session_id,
+        "failure_event_id": attempt_a["failure_event_id"],
+        "attempt_a": {
+            "id": attempt_a["id"],
+            "outcome": attempt_a["outcome"],
+        },
+        "attempt_b": {
+            "id": attempt_b["id"],
+            "outcome": attempt_b["outcome"],
+        },
+        "outcomes_differ": (
+            attempt_a["outcome"] != attempt_b["outcome"]
+        ),
+        "comparison": comparison,
+        "interpretation": (
+            "Different outcomes were recorded; investigate whether "
+            "the changed conditions explain the difference."
+            if attempt_a["outcome"] != attempt_b["outcome"]
+            else
+            "The recorded outcomes match. This does not establish "
+            "that the conditions have no effect."
+        ),
+    }
+
+@app.get(
+    "/sessions/{session_id}/failures/{failure_event_id}/next-experiment"
+)
+def get_next_experiment_recommendation(
+    session_id: str,
+    failure_event_id: str,
+):
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+
+        session = conn.execute(
+            "SELECT id FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+
+        if session is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Session not found",
+            )
+        failure = conn.execute(
+            """
+            SELECT id, event_type
+            FROM events
+            WHERE id = ? AND session_id = ?
+            """,
+            (failure_event_id, session_id),
+        ).fetchone()
+
+        if failure is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Failure event not found in this session",
+            )
+
+        if failure["event_type"] not in FAILURE_TYPES:
+            raise HTTPException(
+                status_code=422,
+                detail="The selected event is not a recognized failure event",
+            )
+        rows = conn.execute(
+            """
+            SELECT
+                id,
+                outcome,
+                conditions_json,
+                created_at
+            FROM reproduction_attempts
+            WHERE session_id = ?
+              AND failure_event_id = ?
+            ORDER BY created_at ASC, rowid ASC
+            """,
+            (session_id, failure_event_id),
+        ).fetchall()
+
+    attempts = []
+
+    for row in rows:
+        item = dict(row)
+
+        try:
+            conditions = json.loads(
+                item.pop("conditions_json") or "{}"
+            )
+        except json.JSONDecodeError:
+            conditions = {}
+
+        if not isinstance(conditions, dict):
+            conditions = {}
+
+        item["conditions"] = conditions
+        attempts.append(item)
+
+    recommendation = recommend_next_experiment(
+        attempts
+    )
+
+    return {
+        "session_id": session_id,
+        "failure_event_id": failure_event_id,
+        "attempt_count": len(attempts),
+        "recommendation": recommendation,
+    }
+@app.post(
+    "/sessions/{session_id}/failures/{failure_event_id}/experiment-recommendations",
+    status_code=201,
+)
+def create_experiment_recommendation(
+    session_id: str,
+    failure_event_id: str,
+):
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+
+        session = conn.execute(
+            "SELECT id FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+
+        if session is None:
+            raise HTTPException(404, "Session not found")
+
+        failure = conn.execute("""
+            SELECT id, event_type
+            FROM events
+            WHERE id = ? AND session_id = ?
+        """, (
+            failure_event_id,
+            session_id,
+        )).fetchone()
+
+        if failure is None:
+            raise HTTPException(
+                404,
+                "Failure event not found in this session",
+            )
+
+        if failure["event_type"] not in FAILURE_TYPES:
+            raise HTTPException(
+                422,
+                "The selected event is not a recognized failure event",
+            )
+
+        rows = conn.execute("""
+            SELECT id, outcome, conditions_json, created_at
+            FROM reproduction_attempts
+            WHERE session_id = ? AND failure_event_id = ?
+            ORDER BY created_at ASC, rowid ASC
+        """, (
+            session_id,
+            failure_event_id,
+        )).fetchall()
+
+        attempts = []
+
+        for row in rows:
+            item = dict(row)
+
+            try:
+                conditions = json.loads(
+                    item.pop("conditions_json") or "{}"
+                )
+            except (json.JSONDecodeError, TypeError):
+                conditions = {}
+
+            if not isinstance(conditions, dict):
+                conditions = {}
+
+            item["conditions"] = conditions
+            attempts.append(item)
+
+        recommendation = recommend_next_experiment(attempts)
+
+        recommendation_id = (
+            f"experiment_{uuid4().hex[:12]}"
+        )
+
+        based_on_attempts = recommendation.get(
+            "based_on_attempts",
+            [],
+        )
+
+        conn.execute("""
+            INSERT INTO experiment_recommendations (
+                id,
+                session_id,
+                failure_event_id,
+                based_on_attempts,
+                recommendation_data,
+                status
+            )
+            VALUES (?, ?, ?, ?, ?, 'proposed')
+        """, (
+            recommendation_id,
+            session_id,
+            failure_event_id,
+            json.dumps(based_on_attempts),
+            json.dumps(recommendation),
+        ))
+
+    return {
+        "recommendation_id": recommendation_id,
+        "session_id": session_id,
+        "failure_event_id": failure_event_id,
+        "status": "proposed",
+        "recommendation": recommendation,
+    }
 
 
+@app.get(
+    "/sessions/{session_id}/failures/{failure_event_id}/experiment-recommendations"
+)
+def list_experiment_recommendations(
+    session_id: str,
+    failure_event_id: str,
+):
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+
+        session = conn.execute(
+            "SELECT id FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+
+        if session is None:
+            raise HTTPException(404, "Session not found")
+
+        failure = conn.execute("""
+            SELECT id, event_type
+            FROM events
+            WHERE id = ? AND session_id = ?
+        """, (
+            failure_event_id,
+            session_id,
+        )).fetchone()
+
+        if failure is None:
+            raise HTTPException(
+                404,
+                "Failure event not found in this session",
+            )
+
+        if failure["event_type"] not in FAILURE_TYPES:
+            raise HTTPException(
+                422,
+                "The selected event is not a recognized failure event",
+            )
+
+        rows = conn.execute("""
+            SELECT *
+            FROM experiment_recommendations
+            WHERE session_id = ? AND failure_event_id = ?
+            ORDER BY created_at DESC, rowid DESC
+        """, (
+            session_id,
+            failure_event_id,
+        )).fetchall()
+
+    recommendations = []
+
+    for row in rows:
+        item = dict(row)
+
+        try:
+            item["based_on_attempts"] = json.loads(
+                item.pop("based_on_attempts") or "[]"
+            )
+        except (json.JSONDecodeError, TypeError):
+            item["based_on_attempts"] = []
+
+        try:
+            item["recommendation"] = json.loads(
+                item.pop("recommendation_data")
+            )
+        except (json.JSONDecodeError, TypeError):
+            item["recommendation"] = {}
+
+        recommendations.append(item)
+
+    return {"recommendations": recommendations}
+
+
+@app.patch(
+    "/sessions/{session_id}/experiment-recommendations/{recommendation_id}"
+)
+def update_experiment_recommendation_status(
+    session_id: str,
+    recommendation_id: str,
+    update: ExperimentRecommendationStatusUpdate,
+):
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+
+        recommendation = conn.execute("""
+            SELECT id, status
+            FROM experiment_recommendations
+            WHERE id = ? AND session_id = ?
+        """, (
+            recommendation_id,
+            session_id,
+        )).fetchone()
+
+        if recommendation is None:
+            raise HTTPException(
+                404,
+                "Experiment recommendation not found in this session",
+            )
+
+        previous_status = recommendation["status"]
+
+        conn.execute("""
+            UPDATE experiment_recommendations
+            SET status = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND session_id = ?
+        """, (
+            update.status,
+            recommendation_id,
+            session_id,
+        ))
+
+    return {
+        "recommendation_id": recommendation_id,
+        "session_id": session_id,
+        "previous_status": previous_status,
+        "status": update.status,
+    }
+
+
+@app.get(
+    "/sessions/{session_id}/experiment-recommendations/{recommendation_id}/evaluation"
+)
+def evaluate_experiment_recommendation(
+    session_id: str,
+    recommendation_id: str,
+):
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+
+        recommendation_row = conn.execute("""
+            SELECT *
+            FROM experiment_recommendations
+            WHERE id = ? AND session_id = ?
+        """, (
+            recommendation_id,
+            session_id,
+        )).fetchone()
+
+        if recommendation_row is None:
+            raise HTTPException(
+                404,
+                "Experiment recommendation not found in this session",
+            )
+
+        recommendation_record = dict(recommendation_row)
+
+        rows = conn.execute("""
+            SELECT id, outcome, notes, conditions_json, created_at
+            FROM reproduction_attempts
+            WHERE session_id = ?
+              AND failure_event_id = ?
+              AND recommendation_id = ?
+            ORDER BY created_at ASC, rowid ASC
+        """, (
+            session_id,
+            recommendation_record["failure_event_id"],
+            recommendation_id,
+        )).fetchall()
+
+    attempts = []
+
+    for row in rows:
+        item = dict(row)
+
+        try:
+            conditions = json.loads(
+                item.pop("conditions_json") or "{}"
+            )
+        except (json.JSONDecodeError, TypeError):
+            conditions = {}
+
+        item["conditions"] = (
+            conditions if isinstance(conditions, dict) else {}
+        )
+        attempts.append(item)
+
+    outcome_counts = {
+        "reproduced": 0,
+        "not_reproduced": 0,
+        "inconclusive": 0,
+    }
+
+    for attempt in attempts:
+        if attempt["outcome"] in outcome_counts:
+            outcome_counts[attempt["outcome"]] += 1
+
+    try:
+        recommendation_data = json.loads(
+            recommendation_record["recommendation_data"]
+        )
+    except (json.JSONDecodeError, TypeError):
+        recommendation_data = {}
+
+    experiment = recommendation_data.get(
+        "recommended_experiment"
+    ) or {}
+
+    condition_name = experiment.get(
+        "condition_to_investigate"
+    )
+
+    baseline_value = experiment.get("baseline_value")
+    comparison_value = experiment.get("comparison_value")
+
+    condition_observations = []
+
+    if condition_name:
+        for attempt in attempts:
+            condition_observations.append({
+                "attempt_id": attempt["id"],
+                "outcome": attempt["outcome"],
+                "recorded_value": attempt["conditions"].get(
+                    condition_name
+                ),
+            })
+
+    return {
+        "recommendation_id": recommendation_id,
+        "session_id": session_id,
+        "failure_event_id": recommendation_record["failure_event_id"],
+        "recommendation_status": recommendation_record["status"],
+        "linked_attempt_count": len(attempts),
+        "outcome_counts": outcome_counts,
+        "experiment_condition": condition_name,
+        "suggested_baseline_value": baseline_value,
+        "suggested_comparison_value": comparison_value,
+        "condition_observations": condition_observations,
+        "attempts": attempts,
+        "interpretation": (
+            "This evaluation summarizes linked reproduction attempts "
+            "and their recorded conditions. It does not establish "
+            "causation or prove a root cause."
+        ),
+    }
+def compare_conditions(conditions_a, conditions_b):
+    all_keys = sorted(set(conditions_a) | set(conditions_b))
+
+    same = {}
+    different = {}
+    unknown = []
+
+    for key in all_keys:
+        value_a = conditions_a.get(key)
+        value_b = conditions_b.get(key)
+
+        if value_a is None or value_b is None:
+            unknown.append({
+                "condition": key,
+                "attempt_a": value_a,
+                "attempt_b": value_b,
+            })
+        elif value_a == value_b:
+            same[key] = value_a
+        else:
+            different[key] = {
+                "attempt_a": value_a,
+                "attempt_b": value_b,
+            }
+
+    return {
+        "same": same,
+        "different": different,
+        "unknown": unknown,
+        "causality_warning": (
+            "Condition differences show association only; "
+            "they do not prove the root cause."
+        ),
+    }
+def recommend_next_experiment(attempts):
+    informative_attempts = [
+        attempt
+        for attempt in attempts
+        if attempt.get("outcome") in {
+            "reproduced",
+            "not_reproduced",
+        }
+    ]
+
+    if len(informative_attempts) < 2:
+        return {
+            "status": "insufficient_data",
+            "message": (
+                "At least two informative reproduction attempts "
+                "are needed to recommend a comparison-based experiment."
+            ),
+            "recommended_experiment": None,
+            "keep_constant": [],
+            "change_one_at_a_time": [],
+            "reason": (
+                "More reproduction evidence is required."
+            ),
+        }
+
+    pair = None
+
+    for i in range(len(informative_attempts)):
+        for j in range(i + 1, len(informative_attempts)):
+            if (
+                informative_attempts[i]["outcome"]
+                != informative_attempts[j]["outcome"]
+            ):
+                pair = (
+                    informative_attempts[i],
+                    informative_attempts[j],
+                )
+                break
+
+        if pair:
+            break
+
+    if pair is None:
+        pair = (
+            informative_attempts[0],
+            informative_attempts[1],
+        )
+
+    attempt_a, attempt_b = pair
+
+    conditions_a = attempt_a.get("conditions") or {}
+    conditions_b = attempt_b.get("conditions") or {}
+
+    comparison = compare_conditions(
+        conditions_a,
+        conditions_b,
+    )
+
+    same_conditions = comparison["same"]
+    different_conditions = comparison["different"]
+    unknown_conditions = comparison["unknown"]
+
+    keep_constant = [
+        {
+            "condition": key,
+            "value": value,
+        }
+        for key, value in same_conditions.items()
+    ]
+
+    if different_conditions:
+        first_changed_condition = sorted(
+            different_conditions
+        )[0]
+
+        values = different_conditions[
+            first_changed_condition
+        ]
+
+        return {
+            "status": "recommendation_available",
+            "based_on_attempts": [
+                attempt_a["id"],
+                attempt_b["id"],
+            ],
+            "recommended_experiment": {
+                "condition_to_investigate": (
+                    first_changed_condition
+                ),
+                "baseline_value": values["attempt_a"],
+                "comparison_value": values["attempt_b"],
+                "instruction": (
+                    "Repeat the test while changing only this "
+                    "condition. Keep other relevant conditions "
+                    "constant."
+                ),
+            },
+            "keep_constant": keep_constant,
+            "change_one_at_a_time": list(
+                different_conditions.keys()
+            ),
+            "unknown_conditions": unknown_conditions,
+            "reason": (
+                "The selected attempts contain different recorded "
+                "conditions. Testing one changed condition at a time "
+                "can help investigate its relationship with the failure."
+            ),
+            "causality_warning": (
+                "This is an experiment suggestion, not proof "
+                "that the selected condition caused the failure."
+            ),
+        }
+
+    if unknown_conditions:
+        return {
+            "status": "more_evidence_needed",
+            "based_on_attempts": [
+                attempt_a["id"],
+                attempt_b["id"],
+            ],
+            "recommended_experiment": None,
+            "keep_constant": keep_constant,
+            "unknown_conditions": unknown_conditions,
+            "reason": (
+                "Some conditions are missing from one or both "
+                "attempts. Record these conditions before drawing "
+                "a meaningful comparison."
+            ),
+            "causality_warning": (
+                "Missing condition data prevents a reliable "
+                "comparison."
+            ),
+        }
+
+    if attempt_a["outcome"] != attempt_b["outcome"]:
+        return {
+            "status": "more_evidence_needed",
+            "based_on_attempts": [
+                attempt_a["id"],
+                attempt_b["id"],
+            ],
+            "recommended_experiment": None,
+            "keep_constant": keep_constant,
+            "reason": (
+                "The outcomes differ even though all recorded "
+                "conditions match. Investigate unrecorded variables "
+                "such as timing, application state, or environment."
+            ),
+            "suggested_additional_conditions": [
+                "Application version",
+                "Operating system",
+                "Time of test",
+                "Relevant application state",
+            ],
+            "causality_warning": (
+                "Matching recorded conditions do not guarantee "
+                "that every relevant condition was captured."
+            ),
+        }
+
+    return {
+        "status": "more_evidence_needed",
+        "based_on_attempts": [
+            attempt_a["id"],
+            attempt_b["id"],
+        ],
+        "recommended_experiment": None,
+        "keep_constant": keep_constant,
+        "reason": (
+            "The selected attempts have matching conditions "
+            "and matching outcomes. Record another attempt with "
+            "additional relevant context before selecting a "
+            "condition to investigate."
+        ),
+        "causality_warning": (
+            "Matching outcomes do not establish that the "
+            "recorded conditions are irrelevant."
+        ),
+    }
 @app.get(
     "/sessions/{session_id}/failures/{failure_event_id}/confidence"
 )

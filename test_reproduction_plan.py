@@ -224,3 +224,38 @@ def test_missing_context_is_reported(test_db):
         for step in result["steps"]
     )
     assert result["limitations"]
+
+def test_next_experiment_rejects_event_from_another_session(test_db):
+    add_event(
+        "session-2",
+        "failure-other",
+        "network_error",
+        {"message": "Connection failed"},
+        "2026-01-01T10:00:05",
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        main.get_next_experiment_recommendation(
+            "session-1",
+            "failure-other",
+        )
+
+    assert exc.value.status_code == 404
+
+
+def test_next_experiment_rejects_non_failure_event(test_db):
+    add_event(
+        "session-1",
+        "navigation-1",
+        "navigation",
+        {"url": "https://example.com"},
+        "2026-01-01T10:00:00",
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        main.get_next_experiment_recommendation(
+            "session-1",
+            "navigation-1",
+        )
+
+    assert exc.value.status_code == 422

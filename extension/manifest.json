@@ -1,9 +1,8 @@
-
 {
   "manifest_version": 3,
-  "name": "ReplayOS Recorder",
+  "name": "TraceForge Recorder",
   "version": "0.1.0",
-  "description": "Record selected browser interactions for debugging.",
+  "description": "Capture selected browser events for evidence-driven failure investigation.",
   "permissions": [
     "activeTab",
     "scripting",

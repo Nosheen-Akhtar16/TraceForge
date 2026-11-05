@@ -1,4 +1,3 @@
-
 (async function () {
   if (window.__replayOSInstalled) return;
 
@@ -96,21 +95,5 @@
     });
   }, true);
 
-  window.addEventListener("unhandledrejection", event => {
-    let reason;
 
-    if (event.reason instanceof Error) {
-      reason = `${event.reason.name}: ${event.reason.message}`;
-    } else if (
-      ["string", "number", "boolean"].includes(typeof event.reason)
-    ) {
-      reason = String(event.reason);
-    } else {
-      reason = "Promise rejected with a non-primitive value";
-    }
-
-    sendEvent("unhandled_promise_rejection", {
-      message: reason.slice(0, 1000)
-    });
-  });
 })();

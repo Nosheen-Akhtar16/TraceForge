@@ -1,6 +1,20 @@
-﻿.venv/
+﻿# Python
+.venv/
 __pycache__/
+*.pyc
 .pytest_cache/
-*.py[cod]
+
+# Node
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# Environment
 .env
+.env.*
+
+# Database
 *.db
+*.sqlite3
+
+*.backup
