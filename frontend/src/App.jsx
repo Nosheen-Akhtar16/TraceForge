@@ -13,7 +13,15 @@ async function request(path, options={}) {
 }
 function App(){
   const [projects,setProjects]=useState([]), [sessions,setSessions]=useState([]), [events,setEvents]=useState([]);
-  const [projectId,setProjectId]=useState(""), [sessionId,setSessionId]=useState(""), [failureId,setFailureId]=useState("");
+  const [projectId,setProjectId]=useState(
+  () => localStorage.getItem("traceforge_project_id") || ""
+);
+
+const [sessionId,setSessionId]=useState(
+  () => localStorage.getItem("traceforge_session_id") || ""
+);
+
+const [failureId,setFailureId]=useState("");
   const [evidence,setEvidence]=useState(null), [plans,setPlans]=useState([]), [attempts,setAttempts]=useState([]);
   const [confidence,setConfidence]=useState(null), [recommendations,setRecommendations]=useState([]);
   const [loading,setLoading]=useState(false), [error,setError]=useState(""), [notice,setNotice]=useState("");
@@ -31,6 +39,21 @@ function App(){
   },[]);
   useEffect(()=>{loadProjects().catch(e=>setError(e.message));},[loadProjects]);
   useEffect(()=>{if(!projectId)return;request(`/projects/${projectId}/sessions`).then(d=>setSessions(d.sessions||[])).catch(e=>setError(e.message));},[projectId]);
+  useEffect(() => {
+  if (projectId) {
+    localStorage.setItem("traceforge_project_id", projectId);
+  } else {
+    localStorage.removeItem("traceforge_project_id");
+  }
+}, [projectId]);
+
+useEffect(() => {
+  if (sessionId) {
+    localStorage.setItem("traceforge_session_id", sessionId);
+  } else {
+    localStorage.removeItem("traceforge_session_id");
+  }
+}, [sessionId]);
   useEffect(()=>{if(sessionId)loadSessionData(sessionId).catch(e=>setError(e.message));},[sessionId,loadSessionData]);
   const failures=useMemo(()=>events.filter(e=>FAILURE_TYPES.has(e.event_type)),[events]);
   const selectedFailure=failures.find(e=>e.id===failureId)||failures[0]||null;
